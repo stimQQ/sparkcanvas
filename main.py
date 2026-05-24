@@ -1763,15 +1763,37 @@ async def wait_for_image_task(client, task_id, provider=None):
     initial_delay = APIMART_IMAGE_INITIAL_POLL_DELAY if (is_apimart or is_apimodels) else 0
     deadline = time.monotonic() + timeout
     last_payload = {}
+    transient_fail_streak = 0
     while time.monotonic() < deadline:
         if initial_delay:
             await asyncio.sleep(min(initial_delay, max(0.0, deadline - time.monotonic())))
             initial_delay = 0
             if time.monotonic() >= deadline:
                 break
-        response = await client.get(task_url, params=request_params, headers=api_headers(provider=provider))
-        response.raise_for_status()
-        last_payload = response.json()
+        # 单次 GET 失败时,把它当成"任务还没好",继续下个 interval 重试 —— 避免本机到上游的偶发 TLS/连接抖动直接让用户失败。
+        try:
+            response = await client.get(task_url, params=request_params, headers=api_headers(provider=provider))
+            response.raise_for_status()
+            last_payload = response.json()
+            transient_fail_streak = 0
+        except (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError,
+                httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout) as exc:
+            transient_fail_streak += 1
+            print(f"[wait_for_image_task] 轮询 GET 网络错误({type(exc).__name__}) 第 {transient_fail_streak} 次,继续等待...")
+            if transient_fail_streak >= 10:
+                raise HTTPException(status_code=502, detail=f"连续 10 次轮询连不上 {task_url}, 放弃。最后一次错误: {type(exc).__name__}") from exc
+            await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+            continue
+        except httpx.HTTPStatusError as exc:
+            # 5xx 当临时;4xx 抛
+            if 500 <= exc.response.status_code < 600:
+                transient_fail_streak += 1
+                print(f"[wait_for_image_task] 轮询拿到 HTTP {exc.response.status_code},当作临时,继续等待...")
+                if transient_fail_streak >= 10:
+                    raise HTTPException(status_code=502, detail=f"连续 10 次轮询拿到 {exc.response.status_code}, 放弃") from exc
+                await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+                continue
+            raise
         task_data = last_payload.get("data") if isinstance(last_payload.get("data"), dict) else last_payload
         if is_apimodels:
             state = str(task_data.get("state") or task_data.get("status") or "").lower()
@@ -2974,6 +2996,78 @@ async def generate_runninghub_provider_image(prompt, size, model, reference_imag
 APIMODELS_LLM_ENDPOINT = "https://apimodels.app/api/v1/messages"
 PLANNER_DEFAULT_MODEL = os.getenv("PLANNER_MODEL", "gpt-5.1")
 
+# -------- 节点类型 Registry(单一来源) --------
+# 加新节点只需在此 dict 里写一条;Planner / API / 运行时自动感知。
+# 字段说明:
+#   label           : 友好显示名
+#   category        : input / transform / ai_generate / output / control
+#   description     : 节点用途(给开发者看)
+#   llm_hint        : 用什么场景(给规划 LLM 看)
+#   fields          : 用户可编辑字段 [{name, type, default, options}, ...]
+#   input_types     : 上游可连入的节点类型(语义,非强制)
+#   output_types    : 本节点产物类型
+#   creatable_by_llm: 规划器是否可以主动创建这个节点(false 的节点对 LLM 不可见)
+#   handler         : 后端运行时函数名(无则纯前端节点)
+NODE_TYPE_REGISTRY = {
+    "image": {
+        "label": "图片输入",
+        "category": "input",
+        "description": "用户拖入或上传的图片节点",
+        "llm_hint": "代表用户提供的原始图片。生成的工作流通常以 1-N 个 image 节点起手,url 留空让用户后续拖图进去。",
+        "fields": [
+            {"name": "url", "type": "image_url", "default": ""},
+            {"name": "name", "type": "string", "default": "空白图片"},
+        ],
+        "input_types": [],
+        "output_types": ["image"],
+        "creatable_by_llm": True,
+        "handler": None,
+    },
+    "prompt": {
+        "label": "提示词",
+        "category": "input",
+        "description": "纯文本提示词节点,作为下游 generator/llm 的指令",
+        "llm_hint": "把规划好的提示词(中文/英文皆可)写在 text 字段。简洁有效,描述风格/构图/约束。",
+        "fields": [
+            {"name": "text", "type": "text", "default": ""},
+        ],
+        "input_types": [],
+        "output_types": ["text"],
+        "creatable_by_llm": True,
+        "handler": None,
+    },
+    "generator": {
+        "label": "AI 生成 (通用图像)",
+        "category": "ai_generate",
+        "description": "走 apimodels/runninghub 等图像生成 API",
+        "llm_hint": "图像生成的主力节点。apiProvider 必须是可用 provider id;model 必须在该 provider 的 image_models 列表里。",
+        "fields": [
+            {"name": "apiProvider", "type": "string", "default": "apimodels"},
+            {"name": "model", "type": "string", "default": "gpt-image-2-lite"},
+            {"name": "ratio", "type": "enum", "options": ["square", "portrait", "landscape", "wide", "tall"], "default": "square"},
+            {"name": "resolution", "type": "enum", "options": ["1k", "2k", "4k"], "default": "1k"},
+        ],
+        "input_types": ["image", "text"],
+        "output_types": ["image"],
+        "creatable_by_llm": True,
+        "handler": "generate_ai_image",
+    },
+    "output": {
+        "label": "输出展示",
+        "category": "output",
+        "description": "展示上游 generator 的结果",
+        "llm_hint": "每个 generator 都应该连一个 output。多步流程里每个关键步骤都加一个 output 方便用户查看。",
+        "fields": [],
+        "input_types": ["image"],
+        "output_types": [],
+        "creatable_by_llm": True,
+        "handler": None,
+    },
+}
+
+def planner_visible_node_types():
+    return {k: v for k, v in NODE_TYPE_REGISTRY.items() if v.get("creatable_by_llm")}
+
 def build_planner_model_catalog():
     """构造一份给 LLM 看的能力清单(只列用户实际可用的图像模型/AI App)。"""
     providers = load_api_providers()
@@ -3000,33 +3094,54 @@ def build_planner_model_catalog():
             lines.append(f"    * {m}{note}")
     return "\n".join(lines) if lines else "(无可用模型)"
 
-PLANNER_SYSTEM_PROMPT = """你是一个 AI 工作流编排专家。用户用自然语言描述需求,你要把它拆解成画布上的节点和连线。
+def render_node_type_for_prompt(type_id, spec):
+    """把 registry 一条转成 system prompt 里的一段描述。"""
+    fields = spec.get("fields") or []
+    field_desc = ", ".join(
+        f"{f['name']}({f['type']}"
+        + (f", options={f['options']}" if f.get("options") else "")
+        + ")"
+        for f in fields
+    ) or "(无可编辑字段)"
+    in_t = ",".join(spec.get("input_types") or []) or "—"
+    out_t = ",".join(spec.get("output_types") or []) or "—"
+    return (
+        f"- {type_id} ({spec.get('label','')}): {spec.get('llm_hint','')}\n"
+        f"    fields: {field_desc}\n"
+        f"    input_types: {in_t}  output_types: {out_t}"
+    )
 
-# 画布节点类型
-- image      : 输入图片节点。字段 {id, type, url(留空让用户拖入), name}
-- prompt     : 提示词节点。字段 {id, type, text(必填,你写好)}
-- generator  : AI 生成节点。字段 {id, type, apiProvider, model, ratio("square"|"portrait"|"landscape"|"wide"|"tall")}
-- output     : 输出节点。字段 {id, type}
+def build_planner_system_prompt():
+    """根据 NODE_TYPE_REGISTRY + 用户实际的图像模型 catalog 动态生成 LLM 系统提示词。"""
+    node_block = "\n".join(
+        render_node_type_for_prompt(tid, spec)
+        for tid, spec in planner_visible_node_types().items()
+    )
+    catalog = build_planner_model_catalog()
+    return f"""你是一个 AI 工作流编排专家。用户用自然语言描述需求,你要把它拆解成画布上的节点和连线 DAG。
+
+# 可用节点类型
+{node_block}
 
 # 连接
-每个 connection {id, from(节点id), to(节点id)}。输入图/prompt → generator → output。多输入可 fan-in 到同一 generator。
+每个 connection {{id, from(节点id), to(节点id)}}。典型流向:输入(image/prompt) → 处理(generator) → 输出(output)。多输入可 fan-in 到同一处理节点。
 
-# 用户可用的 image 模型
-{CATALOG}
+# 用户可用的图像模型
+{catalog}
 
 # 输出严格 JSON(不要 markdown 包裹,不要解释)
-{
-  "nodes": [...],
-  "connections": [...],
+{{
+  "nodes": [{{"id": "...", "type": "...", ...其他 fields}}],
+  "connections": [{{"id": "...", "from": "...", "to": "..."}}],
   "summary": "一句话总结这个工作流做什么"
-}
+}}
 
 # 规则
 1. 节点 id 用语义短名:img_1, prompt_1, gen_1, out_1
-2. 每个 generator 必须连一个 output;通常也要一个 prompt 输入
-3. 若 ai-app 自带 prompt 字段,仍可给 prompt 节点(运行时会注入);若 ai-app 纯图生图(只有 image 字段),可不连 prompt 节点
-4. provider_id 必须是上面列表里出现过的 id;model 必须是该 provider 下列出的 ID
-5. ratio 按需求选:产品图竖屏选 portrait,横版海报选 landscape 或 wide
+2. 每个 ai_generate 节点(如 generator)必须连一个 output;通常也要一个 prompt 输入
+3. 若 ai-app 自带 prompt 字段,仍可给 prompt 节点(运行时会注入);若 ai-app 纯图生图,可不连 prompt
+4. apiProvider 必须是图像模型列表里出现过的 provider_id;model 必须是该 provider 下列出的 ID
+5. ratio 按需求选:产品图竖屏 portrait,横版海报 landscape 或 wide
 6. 不要输出 x/y 坐标,后端自动布局
 """
 
@@ -3159,11 +3274,15 @@ class AutoPlanRequest(BaseModel):
     description: str = Field(min_length=1, max_length=4000)
     model: str = ""
 
+@app.get("/api/node-types")
+async def list_node_types():
+    """返回节点类型 registry,供前端动态渲染节点 UI / 工具栏。"""
+    return {"node_types": NODE_TYPE_REGISTRY}
+
 @app.post("/api/canvas/auto-plan")
 async def canvas_auto_plan(payload: AutoPlanRequest):
     """LLM 把用户描述拆成画布节点+连线。"""
-    catalog = build_planner_model_catalog()
-    system_prompt = PLANNER_SYSTEM_PROMPT.replace("{CATALOG}", catalog)
+    system_prompt = build_planner_system_prompt()
     raw_text = await call_apimodels_llm(
         messages=[{"role": "user", "content": payload.description.strip()}],
         system=system_prompt,
