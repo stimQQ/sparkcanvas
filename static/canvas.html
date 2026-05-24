@@ -4669,7 +4669,10 @@
                 const label = { queued:'排队中', running:'运行中', done:'完成', failed:'失败' }[node.runStatus] || '';
                 return `<span class="node-run-status ${node.runStatus}"><span class="dot"></span>${escapeHtml(label)}${node._cascadeIdx?' '+node._cascadeIdx:''}</span>`;
             })() : '';
-            el.innerHTML = `<div class="node-head"><span class="node-title">${title}</span><div style="display:flex;align-items:center;gap:8px">${statusHtml}<button onclick="deleteNode('${node.id}', event)" class="text-gray-300 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button></div></div>`;
+            const replaceImageBtn = node.type === 'image'
+                ? `<button onclick="event.stopPropagation(); pickImageForNode('${node.id}')" class="text-gray-300 hover:text-blue-500" title="${node.url ? '替换图片' : '上传图片'}"><i data-lucide="image-up" class="w-4 h-4"></i></button>`
+                : '';
+            el.innerHTML = `<div class="node-head"><span class="node-title">${title}</span><div style="display:flex;align-items:center;gap:8px">${statusHtml}${replaceImageBtn}<button onclick="deleteNode('${node.id}', event)" class="text-gray-300 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button></div></div>`;
             const body = document.createElement('div');
             body.className = 'node-body';
             if(node.type === 'image') {
