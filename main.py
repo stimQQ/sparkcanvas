@@ -2969,6 +2969,231 @@ async def generate_runninghub_provider_image(prompt, size, model, reference_imag
         result = await wait_for_runninghub_image_task(client, provider, task_id)
         return runninghub_extract_image(result), result
 
+# ===================== Canvas Auto-Plan (LLM Workflow Planner) =====================
+
+APIMODELS_LLM_ENDPOINT = "https://apimodels.app/api/v1/messages"
+PLANNER_DEFAULT_MODEL = os.getenv("PLANNER_MODEL", "gpt-5.1")
+
+def build_planner_model_catalog():
+    """构造一份给 LLM 看的能力清单(只列用户实际可用的图像模型/AI App)。"""
+    providers = load_api_providers()
+    lines = []
+    for p in providers:
+        if not p.get("enabled", True): continue
+        pid = p.get("id")
+        models = p.get("image_models") or []
+        if not models: continue
+        lines.append(f"- provider_id={pid}({p.get('name')}):")
+        for m in models[:30]:
+            note = ""
+            if m.startswith("ai-app/"):
+                wid = m.split("/", 1)[1]
+                w = find_runninghub_webapp(wid)
+                if w:
+                    cats = {}
+                    for t in (w.get("template") or []):
+                        cats[t.get("category","param")] = cats.get(t.get("category","param"),0)+1
+                    sig = ",".join(f"{k}×{v}" for k,v in cats.items() if k!='param')
+                    note = f"   # AI App: {w.get('name')} (输入: {sig})"
+                else:
+                    note = "   # AI App (未导入模板)"
+            lines.append(f"    * {m}{note}")
+    return "\n".join(lines) if lines else "(无可用模型)"
+
+PLANNER_SYSTEM_PROMPT = """你是一个 AI 工作流编排专家。用户用自然语言描述需求,你要把它拆解成画布上的节点和连线。
+
+# 画布节点类型
+- image      : 输入图片节点。字段 {id, type, url(留空让用户拖入), name}
+- prompt     : 提示词节点。字段 {id, type, text(必填,你写好)}
+- generator  : AI 生成节点。字段 {id, type, apiProvider, model, ratio("square"|"portrait"|"landscape"|"wide"|"tall")}
+- output     : 输出节点。字段 {id, type}
+
+# 连接
+每个 connection {id, from(节点id), to(节点id)}。输入图/prompt → generator → output。多输入可 fan-in 到同一 generator。
+
+# 用户可用的 image 模型
+{CATALOG}
+
+# 输出严格 JSON(不要 markdown 包裹,不要解释)
+{
+  "nodes": [...],
+  "connections": [...],
+  "summary": "一句话总结这个工作流做什么"
+}
+
+# 规则
+1. 节点 id 用语义短名:img_1, prompt_1, gen_1, out_1
+2. 每个 generator 必须连一个 output;通常也要一个 prompt 输入
+3. 若 ai-app 自带 prompt 字段,仍可给 prompt 节点(运行时会注入);若 ai-app 纯图生图(只有 image 字段),可不连 prompt 节点
+4. provider_id 必须是上面列表里出现过的 id;model 必须是该 provider 下列出的 ID
+5. ratio 按需求选:产品图竖屏选 portrait,横版海报选 landscape 或 wide
+6. 不要输出 x/y 坐标,后端自动布局
+"""
+
+# 与 canvas.html 里 .xxx-node { width: ... } 对齐;高度是经验估算
+NODE_DIMENSIONS = {
+    "image":     (260, 240),
+    "prompt":    (310, 200),
+    "generator": (380, 280),
+    "msgen":     (380, 280),
+    "video":     (380, 300),
+    "llm":       (320, 240),
+    "loop":      (336, 220),
+    "output":    (300, 240),
+}
+NODE_DEFAULT_DIM = (300, 220)
+LAYOUT_COL_GAP = 100
+LAYOUT_ROW_GAP = 50
+LAYOUT_BASE_X = 200
+LAYOUT_BASE_Y = 200
+
+def auto_layout_nodes(nodes, connections):
+    """层级布局:按 connection 拓扑深度分列,列宽取该列最宽节点 + GAP;同列内按类型排序后累加 y(避免重叠)。"""
+    from collections import defaultdict, deque
+    in_edges = defaultdict(list)
+    out_edges = defaultdict(list)
+    node_map = {n["id"]: n for n in nodes if "id" in n}
+    if not node_map:
+        return nodes
+    for c in connections or []:
+        f, t = c.get("from"), c.get("to")
+        if f in node_map and t in node_map:
+            in_edges[t].append(f)
+            out_edges[f].append(t)
+    # 拓扑深度(BFS,跳环)
+    depth = {nid: 0 for nid in node_map}
+    queue = deque([nid for nid in node_map if not in_edges[nid]])
+    seen = set()
+    while queue:
+        nid = queue.popleft()
+        if nid in seen: continue
+        seen.add(nid)
+        for nxt in out_edges[nid]:
+            nd = depth[nid] + 1
+            if nd > depth[nxt]:
+                depth[nxt] = nd
+            queue.append(nxt)
+    # 按列分组
+    by_col = defaultdict(list)
+    for nid, d in depth.items():
+        by_col[d].append(nid)
+    # 每列宽 = 该列最宽节点宽度
+    col_width = {}
+    for col, ids in by_col.items():
+        col_width[col] = max(NODE_DIMENSIONS.get(node_map[i].get("type"), NODE_DEFAULT_DIM)[0] for i in ids)
+    # 累积每列起始 x
+    col_x = {}
+    cur_x = LAYOUT_BASE_X
+    for col in sorted(by_col.keys()):
+        col_x[col] = cur_x
+        cur_x += col_width[col] + LAYOUT_COL_GAP
+    # 同列按类型排序:输入(image/prompt) → 处理(gen/msgen/video/llm/loop) → 输出(output)
+    type_order = {"image": 0, "prompt": 1, "generator": 2, "msgen": 2, "video": 2, "llm": 2, "loop": 2, "output": 3}
+    for col, ids in by_col.items():
+        ids.sort(key=lambda i: (type_order.get(node_map[i].get("type"), 9), i))
+        cur_y = LAYOUT_BASE_Y
+        for nid in ids:
+            h = NODE_DIMENSIONS.get(node_map[nid].get("type"), NODE_DEFAULT_DIM)[1]
+            node_map[nid]["x"] = col_x[col]
+            node_map[nid]["y"] = cur_y
+            cur_y += h + LAYOUT_ROW_GAP
+    return nodes
+
+def extract_planner_json(text: str):
+    """从 LLM 输出里抽 JSON(允许有 markdown 包裹)。"""
+    t = text.strip()
+    # 去 ```json ... ``` 包裹
+    m = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", t)
+    if m:
+        t = m.group(1).strip()
+    # 找最外层 { }
+    start = t.find("{")
+    end = t.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("没找到 JSON 对象")
+    return json.loads(t[start:end+1])
+
+async def call_apimodels_llm(messages, system, model=None, max_tokens=4096):
+    """调 apimodels /api/v1/messages 拿 LLM 回复(支持 Claude/Gemini/OpenAI 三家;这里只用 OpenAI 格式 model)。"""
+    api_key = os.getenv("API_PROVIDER_APIMODELS_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="未配置 apimodels API Key,请到 API 设置里填写")
+    model = model or PLANNER_DEFAULT_MODEL
+    body = {
+        "model": model,
+        "messages": (
+            ([{"role": "system", "content": system}] if system else []) + messages
+        ),
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
+    }
+    timeout = httpx.Timeout(connect=20.0, read=180.0, write=60.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        last_exc = None
+        for attempt in range(3):
+            try:
+                r = await client.post(APIMODELS_LLM_ENDPOINT,
+                                       headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                                       json=body)
+                r.raise_for_status()
+                data = r.json()
+                # OpenAI 格式
+                if isinstance(data, dict) and isinstance(data.get("choices"), list) and data["choices"]:
+                    return data["choices"][0]["message"]["content"]
+                # Claude 格式
+                if isinstance(data, dict) and isinstance(data.get("content"), list):
+                    parts = [b.get("text","") for b in data["content"] if b.get("type")=="text"]
+                    if parts: return "".join(parts)
+                # Gemini 格式
+                if isinstance(data, dict) and isinstance(data.get("candidates"), list):
+                    cand = data["candidates"][0]
+                    return "".join(p.get("text","") for p in cand.get("content",{}).get("parts",[]))
+                raise HTTPException(status_code=502, detail=f"无法识别 LLM 响应格式: {str(data)[:200]}")
+            except (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError, httpx.ConnectTimeout) as exc:
+                last_exc = exc
+                if attempt == 2: break
+                await asyncio.sleep(1.0 * (2 ** attempt))
+        if last_exc: raise last_exc
+
+class AutoPlanRequest(BaseModel):
+    description: str = Field(min_length=1, max_length=4000)
+    model: str = ""
+
+@app.post("/api/canvas/auto-plan")
+async def canvas_auto_plan(payload: AutoPlanRequest):
+    """LLM 把用户描述拆成画布节点+连线。"""
+    catalog = build_planner_model_catalog()
+    system_prompt = PLANNER_SYSTEM_PROMPT.replace("{CATALOG}", catalog)
+    raw_text = await call_apimodels_llm(
+        messages=[{"role": "user", "content": payload.description.strip()}],
+        system=system_prompt,
+        model=(payload.model or PLANNER_DEFAULT_MODEL),
+        max_tokens=4096,
+    )
+    try:
+        plan = extract_planner_json(raw_text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM 输出 JSON 解析失败: {e}。原文片段: {raw_text[:400]}")
+    nodes = plan.get("nodes") or []
+    connections = plan.get("connections") or plan.get("edges") or []
+    # 给每个节点添时间戳后缀避免与画布已有 id 冲突;同时记录 id 映射
+    ts = int(time.time() * 1000)
+    id_map = {}
+    for i, n in enumerate(nodes):
+        old_id = n.get("id") or f"node_{i}"
+        new_id = f"{old_id}_{ts}"
+        id_map[old_id] = new_id
+        n["id"] = new_id
+    for c in connections:
+        c["from"] = id_map.get(c.get("from"), c.get("from"))
+        c["to"] = id_map.get(c.get("to"), c.get("to"))
+        if not c.get("id"):
+            c["id"] = f"c_{uuid.uuid4().hex[:10]}_{ts}"
+    auto_layout_nodes(nodes, connections)
+    return {"nodes": nodes, "connections": connections, "summary": plan.get("summary", ""), "raw_text": raw_text}
+
+# ===================== /Canvas Auto-Plan =====================
+
 async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly"):
     provider = get_api_provider(provider_id)
     if provider["id"] == "modelscope":
