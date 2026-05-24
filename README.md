@@ -2,6 +2,48 @@
 
 > 基于 [hero8152/Infinite-Canvas](https://github.com/hero8152/Infinite-Canvas) 进行二次开发
 
+## 快速开始
+
+需要 Python **3.10+**(3.10 / 3.11 / 3.12 / 3.13 / 3.14 都行,建议 3.11/3.12)。
+
+### macOS
+
+```bash
+git clone https://github.com/stimQQ/sparkcanvas.git
+cd sparkcanvas
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python main.py
+```
+
+浏览器打开 `http://127.0.0.1:3000`。也可以双击 `mac-启动服务.command`(首次右键 → 打开,绕过未签名提示)。
+
+### Windows
+
+仓库根目录虽然附带 `python/`(嵌入式 Python 3.10)和 `packages/`(预装 .whl),但**两者的 Python 版本对不上**(wheels 是 cp314 = Python 3.14),所以**不建议**用 bundled 资源,容易装不上。推荐:
+
+```cmd
+git clone https://github.com/stimQQ/sparkcanvas.git
+cd sparkcanvas
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+python main.py
+```
+
+(到 https://www.python.org 装 Python 3.11 或 3.12,装时勾上 "Add Python to PATH")
+
+浏览器打开 `http://127.0.0.1:3000`。
+
+### 首次配置(两个平台一样)
+
+1. 打开 `http://127.0.0.1:3000/static/api-settings.html`
+2. 左侧选 **ApiModels**(默认首选)→ 填你的 Key → 保存
+3. 如需 RunningHub:左侧选 **RunningHub** → 填 Key → 保存。AI App 在 `+ 添加 AI App` 里粘 cURL 导入
+4. 回画布:`http://127.0.0.1:3000/static/canvas.html` 或点首页"画布"。顶部 ✨ AI 生成工作流 可一键拆解需求
+
+---
+
 # Infinite-Canvas
 Supports comfyui/API calls/modelscope calls
 
